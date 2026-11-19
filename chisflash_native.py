@@ -26,7 +26,7 @@ from FlashGBX.RomFileAGB import RomFileAGB
 from FlashGBX.RomFileDMG import RomFileDMG
 
 PLUGIN_NAME = "GBFlash and ChisFlash Carbonate / Beggar"
-PLUGIN_VERSION = "0.3.4"
+PLUGIN_VERSION = "0.3.5"
 PLUGIN_DESCRIPTION = "Adds support for ChisFlash Carbonate and Beggar and a power-on delay for GBFlash."
 IDENTITY_REQUEST = b'\x55\xaa'
 CARBONATE_PRODUCTS = ('ChisFlash Carbonate', 'ChisFlash Carbonate Original')
@@ -112,7 +112,9 @@ def _identify_chisflash(raw):
     """仅对产品名称已确认的碳酸钙查询身份，使用以换行结束的短响应。"""
     packet = IDENTITY_REQUEST
     if raw.write(packet) != len(packet):
-        raise IOError('设备身份请求未完整发送')
+        raise IOError(_localized_label(
+            'Could not send the complete device identification request.',
+            '设备身份请求未完整发送'))
     raw.flush()
     reply = bytearray()
     deadline = time.monotonic() + 1
@@ -123,12 +125,14 @@ def _identify_chisflash(raw):
             if part == b'\n':
                 break
     if not reply.endswith(b'\n'):
-        raise IOError('碳酸钙身份响应不完整')
+        raise IOError(_localized_label('Incomplete Carbonate identification response.', '碳酸钙身份响应不完整'))
     if not reply.startswith(b'\x01ChisFlash'):
         return None
     match = re.fullmatch(rb'\x01ChisFlash( Original)? FW C([0-9]+) (RC[^\r\n ]+)\r\n', bytes(reply))
     if match is None:
-        raise IOError('设备身份响应不完整或无法识别')
+        raise IOError(_localized_label(
+            'The device identification response is incomplete or unrecognized.',
+            '设备身份响应不完整或无法识别'))
     return {'board': 'original' if match[1] else 'modified',
             'protocol': int(match[2]), 'version': match[3].decode('ascii')}
 
@@ -311,7 +315,7 @@ class CarbonateDevice(_PowerOnDelayMixin, _DeviceBase):
         while len(data) < count and time.monotonic() < deadline:
             data.extend(self.DEVICE.read(count - len(data)))
         if len(data) != count:
-            raise IOError('碳酸钙固件信息响应不完整')
+            raise IOError(_localized_label('Incomplete Carbonate firmware information response.', '碳酸钙固件信息响应不完整'))
         return bytes(data)
 
     def LoadFirmwareVersion(self):
@@ -445,30 +449,36 @@ class NativeLink:
         deadline = time.monotonic() + timeout
         while len(result) < count:
             if self.cancelled():
-                raise NativeProtocolError('操作已取消')
+                raise NativeProtocolError(_localized_label('Operation canceled.', '操作已取消'))
             part = self.port.read(count - len(result))
             if part:
                 result.extend(part)
             elif time.monotonic() >= deadline:
-                raise NativeProtocolError(f'盖中盖响应超时：需要 {count} 字节，收到 {len(result)} 字节')
+                raise NativeProtocolError(_localized_label(
+                    f'Timed out waiting for the Beggar response. Expected {count} bytes, received {len(result)}.',
+                    f'盖中盖响应超时：需要 {count} 字节，收到 {len(result)} 字节'))
         return bytes(result)
 
     def request(self, command, body=b'', read_length=None, ack=False, timeout=5):
         with self.lock:
             if self.cancelled():
-                raise NativeProtocolError('操作已取消')
+                raise NativeProtocolError(_localized_label('Operation canceled.', '操作已取消'))
             packet = self.frame(command, body)
             self.history.append((command, len(packet)))
             written = self.port.write(packet)
             if written != len(packet):
-                raise NativeProtocolError('盖中盖请求未完整发送')
+                raise NativeProtocolError(_localized_label(
+                    'Could not send the complete request to Beggar.',
+                    '盖中盖请求未完整发送'))
             self.port.flush()
             if ack:
                 response = self.exact(1, timeout)
                 # 原版单字节 ACK 接收后丢弃残留输入；数据响应不做此处理。
                 self.port.reset_input_buffer()
                 if response != b'\xaa':
-                    raise NativeProtocolError(f'盖中盖 ACK 错误：{response.hex()}')
+                    raise NativeProtocolError(_localized_label(
+                        f'Unexpected ACK from Beggar ({response.hex()}).',
+                        f'盖中盖 ACK 错误：{response.hex()}'))
                 return b''
             if read_length is not None:
                 response = self.exact(read_length + 2, timeout)
@@ -534,7 +544,11 @@ class GbxDevice(_DeviceBase):
         # ???????? FlashGBX ?????????
         self.MODE = None
         self.FW = {'pcb_ver': 2, 'pcb_name': self.DEVICE_NAME, 'cfw_id': 'N', 'fw_ver': 15,
-                   'fw_ts': 0, 'fw_dt': '原生协议不提供固件版本查询', 'cart_power_ctrl': False,
+                   'fw_ts': 0,
+                   'fw_dt': _localized_label(
+                       'The native protocol does not report the firmware version.',
+                       '原生协议不提供固件版本查询'),
+                   'cart_power_ctrl': False,
                    'bootloader_reset': False, 'cart_presence_switch': False, 'cart_mode_switch': False}
         # fw_ver 仅供复用上位机逻辑判断接口级别，不代表设备中安装了 LK 固件。
         self.FW_VAR = {name: 0 for name in self.DEVICE_VAR}
@@ -591,7 +605,7 @@ class GbxDevice(_DeviceBase):
 
     def SetMode(self, mode, delay=0.1):
         if mode not in ('AGB', 'DMG'):
-            raise ValueError('不支持的卡带模式')
+            raise ValueError(_localized_label('Unsupported cartridge mode.', '不支持的卡带模式'))
         self.MODE = mode
         self.FW_VAR.update(CART_MODE=2 if mode == 'AGB' else 1, ADDRESS=0)
 
@@ -599,13 +613,19 @@ class GbxDevice(_DeviceBase):
         return self.MODE
 
     def CartPowerOn(self):
-        raise UnsupportedNativeFeature('盖中盖原生协议不支持供电切换')
+        raise UnsupportedNativeFeature(_localized_label(
+            'The Beggar native protocol does not support switching cartridge power.',
+            '盖中盖原生协议不支持供电切换'))
 
     def CartPowerOff(self):
-        raise UnsupportedNativeFeature('盖中盖原生协议不支持供电切换')
+        raise UnsupportedNativeFeature(_localized_label(
+            'The Beggar native protocol does not support switching cartridge power.',
+            '盖中盖原生协议不支持供电切换'))
 
     def CartPowerCycle(self):
-        raise UnsupportedNativeFeature('盖中盖原生协议不支持供电切换')
+        raise UnsupportedNativeFeature(_localized_label(
+            'The Beggar native protocol does not support switching cartridge power.',
+            '盖中盖原生协议不支持供电切换'))
 
     def SetAutoPowerOff(self, value):
         self.SKIP_POWERCYCLE = True
@@ -647,8 +667,13 @@ class GbxDevice(_DeviceBase):
         if self.MODE == 'AGB':
             # 沿用头解析信息和界面容量选择，不为初始化追加容量读取探针。
             data.setdefault('rom_size', 0x2000000)
-        data.update(raw=header, has_rtc=False, rtc_dict={}, rtc_string='首版插件未读取 RTC',
-                    no_rtc_reason='盖中盖 RTC 适配尚未实现')
+        data.update(raw=header, has_rtc=False, rtc_dict={},
+                    rtc_string=_localized_label(
+                        'RTC was not read.',
+                        '首版插件未读取 RTC'),
+                    no_rtc_reason=_localized_label(
+                        'The Beggar plugin does not yet support RTC access.',
+                        '盖中盖 RTC 适配尚未实现'))
         self.INFO.update(data)
         self.INFO.setdefault('dump_info', {})['header'] = data
         self.INFO['flash_type'] = data.get('flash_type', 0)
@@ -657,7 +682,9 @@ class GbxDevice(_DeviceBase):
 
     def ReadRAM(self, address, length, command=None, max_length=4096):
         if command not in (None, self.DEVICE_CMD['AGB_CART_READ_SRAM'], self.DEVICE_CMD['DMG_CART_READ']):
-            raise UnsupportedNativeFeature('该存档读取协议尚未适配盖中盖插件')
+            raise UnsupportedNativeFeature(_localized_label(
+                'The Beggar plugin does not yet support reading this type of save.',
+                '该存档读取协议尚未适配盖中盖插件'))
         with self._lock:
             target = address if self.MODE == 'AGB' else 0xa000 + address
             raw = self._native.read('SRAM' if self.MODE == 'AGB' else 'DMG', target, length)
@@ -668,7 +695,10 @@ class GbxDevice(_DeviceBase):
 
     def WriteRAM(self, address, buffer, command=None, max_length=256):
         if command not in (None, self.DEVICE_CMD['AGB_CART_WRITE_SRAM'], self.DEVICE_CMD['DMG_CART_WRITE_SRAM']):
-            raise UnsupportedNativeFeature('首版插件仅支持普通 SRAM/FRAM 字节接口，不支持 EEPROM/Flash 存档编程')
+            raise UnsupportedNativeFeature(_localized_label(
+                'The Beggar plugin only supports writing byte-addressed SRAM/FRAM saves. '
+                'EEPROM and flash save programming are unsupported.',
+                '首版插件仅支持普通 SRAM/FRAM 字节接口，不支持 EEPROM/Flash 存档编程'))
         with self._lock:
             target = address if self.MODE == 'AGB' else 0xa000 + address
             self._native.write('SRAM' if self.MODE == 'AGB' else 'DMG', target, buffer)
@@ -703,11 +733,17 @@ class GbxDevice(_DeviceBase):
 
     def WriteROM(self, address, buffer, flash_buffer_size=False, skip_init=False, rumble_stop=False, max_length=4096):
         if self.FW_VAR['FLASH_COMMAND_SET'] != 1 or self.FW_VAR['FLASH_METHOD'] not in (1, 2):
-            raise UnsupportedNativeFeature('首版盖中盖插件尚未实现 Intel 或特殊卡带编程算法')
+            raise UnsupportedNativeFeature(_localized_label(
+                'The Beggar plugin does not yet support Intel flash or cartridge-specific programming algorithms.',
+                '首版盖中盖插件尚未实现 Intel 或特殊卡带编程算法'))
         if self.FW_VAR.get('FLASH_WE_PIN', 1) not in (0, 1):
-            raise UnsupportedNativeFeature('盖中盖基础命令不提供 AUDIO/RESET 写脚控制')
+            raise UnsupportedNativeFeature(_localized_label(
+                'The Beggar native protocol does not support controlling the AUDIO/RESET write pin.',
+                '盖中盖基础命令不提供 AUDIO/RESET 写脚控制'))
         if self.MODE == 'DMG' and (self.FW_VAR.get('FLASH_COMMANDS_BANK_1') or self.FW_VAR.get('FLASH_PULSE_RESET')):
-            raise UnsupportedNativeFeature('首版插件尚未实现编程命令期间的特殊换 Bank/复位时序')
+            raise UnsupportedNativeFeature(_localized_label(
+                'The Beggar plugin does not yet support special bank switching or reset timing during programming.',
+                '首版插件尚未实现编程命令期间的特殊换 Bank/复位时序'))
         unit = 2 if self.MODE == 'AGB' else 1
         data = bytes(buffer)
         if self.MODE == 'AGB' and len(data) & 1:
@@ -720,12 +756,14 @@ class GbxDevice(_DeviceBase):
                   and (not page or self._commands[5][1] == 0x29)
                   and not self.FW_VAR.get('FLASH_DOUBLE_DIE'))
         if not normal:
-            raise UnsupportedNativeFeature('原版盖中盖编程入口不提供该命令表，不改用自写编程流程')
+            raise UnsupportedNativeFeature(_localized_label(
+                'The original Beggar programming commands do not support the selected flash command table.',
+                '原版盖中盖编程入口不提供该命令表，不改用自写编程流程'))
         with self._lock:
             done = 0
             while done < len(data):
                 if self.CANCEL:
-                    raise NativeProtocolError('操作已取消')
+                    raise NativeProtocolError(_localized_label('Operation canceled.', '操作已取消'))
                 size = min(4096, len(data) - done)
                 part = data[done:done + size]
                 # F4/FC 在原版固件内执行编程及完成轮询，上位机只接收 ACK。
@@ -759,7 +797,10 @@ class GbxDevice(_DeviceBase):
                 self.FW_VAR['CART_MODE'] = 1
             elif command in (self.DEVICE_CMD['SET_VOLTAGE_3_3V'], self.DEVICE_CMD['SET_VOLTAGE_5V']):
                 if command == self.DEVICE_CMD['SET_VOLTAGE_5V']:
-                    raise UnsupportedNativeFeature('当前设备不由插件切换电压，首版不支持要求切到 5V 的烧录流程')
+                    raise UnsupportedNativeFeature(_localized_label(
+                        'The Beggar plugin cannot switch cartridge voltage. '
+                        'Programming that requires switching to 5 V is unsupported.',
+                        '当前设备不由插件切换电压，首版不支持要求切到 5V 的烧录流程'))
                 # 主线对固定电压设备也发送 3.3V 选择；不伪造实际电源切换。
             elif command == self.DEVICE_CMD['CART_PWR_ON']:
                 self.CartPowerOn()
@@ -767,7 +808,9 @@ class GbxDevice(_DeviceBase):
                 self.CartPowerOff()
             elif command not in (self.DEVICE_CMD['ENABLE_PULLUPS'], self.DEVICE_CMD['DISABLE_PULLUPS'],
                                  self.DEVICE_CMD['SET_ADDR_AS_INPUTS'], self.DEVICE_CMD['DMG_MBC_RESET'], self.DEVICE_CMD['NULL']):
-                raise UnsupportedNativeFeature(f'该功能尚未适配盖中盖插件：0x{command:02X}')
+                raise UnsupportedNativeFeature(_localized_label(
+                    f'The Beggar plugin does not yet support command 0x{command:02X}.',
+                    f'该功能尚未适配盖中盖插件：0x{command:02X}'))
             self._reply.append(1)
         return self._read(1) if wait else None
 
@@ -811,7 +854,9 @@ class GbxDevice(_DeviceBase):
     def ChangeBaudRate(self, value): return None
     def GetDeviceSerial(self): return None
     def _clk_toggle(self, num=1):
-        raise UnsupportedNativeFeature('盖中盖基础协议不支持逐次 CLK 脉冲')
+        raise UnsupportedNativeFeature(_localized_label(
+            'The Beggar native protocol does not support individual CLK pulses.',
+            '盖中盖基础协议不支持逐次 CLK 脉冲'))
 
 
 def plugin_entry():

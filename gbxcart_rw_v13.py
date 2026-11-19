@@ -2,16 +2,22 @@
 
 from types import SimpleNamespace
 
+from FlashGBX import i18n
 from FlashGBX.app import HW_DEVICES
 from FlashGBX.hw_GBxCartRW import GbxDevice as OfficialGBxCartRW
 
 
 PLUGIN_NAME = "GBxCart RW v1.3"
-PLUGIN_DESCRIPTION = "在 FlashGBX 5.2.1 中恢复 GBxCart RW v1.3 的使用，沿用官方设备后端。"
-PLUGIN_VERSION = "0.1.0"
+PLUGIN_DESCRIPTION = "Restores support for GBxCart RW v1.3 in FlashGBX 5.2.1 using the official device backend."
+PLUGIN_VERSION = "0.1.1"
 
 
 class GBxCartRWDevice(OfficialGBxCartRW):
+    def GetFullNameLabel(self):
+        if self.FW["pcb_ver"] == 4 and i18n.CONFIGURED_LANGUAGE == "zh_CN":
+            return f"{self.GetFullName()} – 固件 {self.GetFirmwareVersion()}"
+        return super().GetFullNameLabel()
+
     def FirmwareUpdateAvailable(self):
         pcb = self.FW["pcb_ver"]
         if pcb != 4:

@@ -20,16 +20,20 @@ from FlashGBX.app import AppContext, HW_DEVICES
 from FlashGBX.hw_GBFlash import GbxDevice as _GBFlashBase
 from FlashGBX.hw_JoeyJr import GbxDevice as _DeviceBase
 from FlashGBX.LK_Device import LK_Device, ANSI, dprint
+from FlashGBX import i18n
 from FlashGBX.i18n import __
 from FlashGBX.RomFileAGB import RomFileAGB
 from FlashGBX.RomFileDMG import RomFileDMG
 
-PLUGIN_NAME = "GBFlash 与 ChisFlash 碳酸钙及盖中盖"
-PLUGIN_VERSION = "0.3.3"
-PLUGIN_DESCRIPTION = "沿用 GBFlash/JR 后端及上电 500 ms；盖中盖使用原生事务，不追加写后读回。"
+PLUGIN_NAME = "GBFlash and ChisFlash Carbonate / Beggar"
+PLUGIN_VERSION = "0.3.4"
+PLUGIN_DESCRIPTION = "Adds support for ChisFlash Carbonate and Beggar and a power-on delay for GBFlash."
 IDENTITY_REQUEST = b'\x55\xaa'
 CARBONATE_PRODUCTS = ('ChisFlash Carbonate', 'ChisFlash Carbonate Original')
 
+
+def _localized_label(english, chinese):
+    return chinese if i18n.CONFIGURED_LANGUAGE == 'zh_CN' else english
 
 def _usb_products():
     """只读系统中的 USB 产品名称，不打开串口或向设备发送探测命令。"""
@@ -171,16 +175,21 @@ class GBFlashDevice(_PowerOnDelayMixin, _GBFlashBase):
 
 class CarbonateDevice(_PowerOnDelayMixin, _DeviceBase):
     """沿用官方 JR 后端，仅适配碳酸钙本名身份与硬件能力。"""
-    DEVICE_NAME = 'ChisFlash（碳酸钙）'
+    DEVICE_NAME = 'ChisFlash Carbonate'
+    DEVICE_NAME_ZH = 'ChisFlash（碳酸钙）'
     DEVICE_LABEL_LONG = DEVICE_NAME
-    DEVICE_LABEL_SHORT = '碳酸钙'
+    DEVICE_LABEL_SHORT = 'Carbonate'
     USB_IDS = ((0x0483, 0x0721),)
     PCB_VERSIONS = {2: ''}
     MAX_BUFFER_READ = 0x2000
     MAX_BUFFER_WRITE = 0x800
     FWUPDATE_ACTION = None
     CLI_UPDATER_METHOD = None
-    DEVICE_SUPPORT_MESSAGE = 'ChisFlash 碳酸钙固件及插件；固件升级请使用对应板型的刷写工具。'
+    @staticmethod
+    def DEVICE_SUPPORT_MESSAGE():
+        return _localized_label(
+            'Use the firmware updater for your board revision.',
+            '固件升级请使用对应板型的刷写工具。')
 
     def __init__(self):
         self.DEVICE, self.FW, self.IDENTITY = None, {}, None
@@ -368,12 +377,24 @@ class CarbonateDevice(_PowerOnDelayMixin, _DeviceBase):
         return result
 
     def GetFirmwareVersion(self, more=False):
-        version = self.IDENTITY['version'] if self.IDENTITY else '未知'
-        return f'{version}（协议 {self.FW.get("fw_ver", "未知")}）' if more else version
+        unknown = _localized_label('Unknown', '未知')
+        version = self.IDENTITY['version'] if self.IDENTITY else unknown
+        if not more:
+            return version
+        protocol = self.FW.get('fw_ver', unknown)
+        return _localized_label(f'{version} (protocol {protocol})', f'{version}（协议 {protocol}）')
 
-    def GetFullName(self): return self.DEVICE_NAME
+    def GetName(self):
+        return _localized_label(self.DEVICE_NAME, self.DEVICE_NAME_ZH)
+
+    def GetFullName(self): return self.GetName()
+
+    def GetFullNameLabel(self):
+        firmware = _localized_label('Firmware', '固件')
+        return f'{self.GetFullName()} – {firmware} {self.GetFirmwareVersion()}'
+
     def GetFullNameExtended(self, more=False):
-        return f'{self.DEVICE_NAME} · {self.GetFirmwareVersion(more)} · {self.PORT}'
+        return f'{self.GetFullName()} · {self.GetFirmwareVersion(more)} · {self.PORT}'
     def GetSupportedModes(self): return ['DMG', 'AGB']
     def CanSetVoltageBySwitch(self): return False
     def CanSetVoltageByCode(self): return self.FW.get('pcb_ver') == 2
@@ -492,26 +513,32 @@ class NativeLink:
 
 
 class GbxDevice(_DeviceBase):
-    DEVICE_NAME = 'ChisFlash（盖中盖原生）'
+    DEVICE_NAME = 'ChisFlash Beggar (Native)'
+    DEVICE_NAME_ZH = 'ChisFlash（盖中盖原生）'
     DEVICE_LABEL_LONG = DEVICE_NAME
-    DEVICE_LABEL_SHORT = '盖中盖原生'
+    DEVICE_LABEL_SHORT = 'Beggar (Native)'
     USB_IDS = ((0x0483, 0x0721),)
     MAX_BUFFER_READ = 4096
     MAX_BUFFER_WRITE = 4096
     FWUPDATE_ACTION = None
     CLI_UPDATER_METHOD = None
-    DEVICE_SUPPORT_MESSAGE = '实验版盖中盖插件；当前支持标准 AMD ROM、普通 SRAM 及卡带识别。'
+    @staticmethod
+    def DEVICE_SUPPORT_MESSAGE():
+        return _localized_label(
+            'Experimental Beggar plugin with standard AMD ROM programming, standard SRAM access, and cartridge detection.',
+            '实验版盖中盖插件，支持标准 AMD ROM 烧录、普通 SRAM 读写和卡带识别。')
 
     def __init__(self):
         self.DEVICE = None
         self.PORT = ''
-        self.MODE = 'AGB'
+        # ???????? FlashGBX ?????????
+        self.MODE = None
         self.FW = {'pcb_ver': 2, 'pcb_name': self.DEVICE_NAME, 'cfw_id': 'N', 'fw_ver': 15,
                    'fw_ts': 0, 'fw_dt': '原生协议不提供固件版本查询', 'cart_power_ctrl': False,
                    'bootloader_reset': False, 'cart_presence_switch': False, 'cart_mode_switch': False}
         # fw_ver 仅供复用上位机逻辑判断接口级别，不代表设备中安装了 LK 固件。
         self.FW_VAR = {name: 0 for name in self.DEVICE_VAR}
-        self.FW_VAR.update(CART_MODE=2, STATUS_REGISTER_MASK=0x80, STATUS_REGISTER_VALUE=0x80)
+        self.FW_VAR.update(STATUS_REGISTER_MASK=0x80, STATUS_REGISTER_VALUE=0x80)
         self.INFO = {'action': None, 'last_action': None, 'dump_info': {}}
         self.ERROR_ARGS, self.CANCEL_ARGS = {}, {}
         self.ERROR = self.CANCEL = False
@@ -539,6 +566,8 @@ class GbxDevice(_DeviceBase):
                 _prepare_serial(raw)
                 self.DEVICE, self.PORT = raw, candidate
                 self._native = NativeLink(raw, lambda: self.CANCEL)
+                self.MODE = None
+                self.FW_VAR.update(CART_MODE=0, ADDRESS=0)
                 self.UpdateFlashCarts(flashcarts)
                 return []
             except (OSError, serial.SerialException, NativeProtocolError) as error:
@@ -753,9 +782,19 @@ class GbxDevice(_DeviceBase):
         return self._write(data, wait=True)
 
     def LoadFirmwareVersion(self): return self.IsConnected()
-    def GetFirmwareVersion(self, more=False): return 'Native 插件 ' + PLUGIN_VERSION
-    def GetFullName(self): return self.DEVICE_NAME
-    def GetFullNameExtended(self, more=False): return f'{self.DEVICE_NAME} · {self.PORT} · 插件 {PLUGIN_VERSION}'
+    def GetFirmwareVersion(self, more=False):
+        return _localized_label('Plugin', '插件') + ' ' + PLUGIN_VERSION
+
+    def GetName(self):
+        return _localized_label(self.DEVICE_NAME, self.DEVICE_NAME_ZH)
+
+    def GetFullName(self): return self.GetName()
+
+    def GetFullNameLabel(self):
+        return f'{self.GetFullName()} – {self.GetFirmwareVersion()}'
+
+    def GetFullNameExtended(self, more=False):
+        return f'{self.GetFullName()} · {self.PORT} · {self.GetFirmwareVersion()}'
     def GetSupportedModes(self): return ['DMG', 'AGB']
     def GetSupprtedModes(self): return self.GetSupportedModes()
     def CanSetVoltageBySwitch(self): return False

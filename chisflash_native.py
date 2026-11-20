@@ -1,4 +1,4 @@
-"""FlashGBX 5.2.1 的 ChisFlash 独立后端与盖中盖原生后端。"""
+"""FlashGBX 5.2.1 的 ChisFlash JR 兼容后端与盖中盖旧固件适配。"""
 import copy
 import configparser
 import json
@@ -6,18 +6,23 @@ import math
 import os
 from pathlib import Path
 import datetime
+from queue import Empty, SimpleQueue
 import re
 import struct
 import sys
+from tempfile import NamedTemporaryFile
 import threading
 import time
 from types import SimpleNamespace
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 import zlib
 
 import serial
 import serial.tools.list_ports
 from FlashGBX.app import AppContext, HW_DEVICES
 from FlashGBX.hw_GBFlash import GbxDevice as _GBFlashBase
+from FlashGBX.hw_GBxCartRW import GbxDevice as OfficialGBxCartRW
 from FlashGBX.hw_JoeyJr import GbxDevice as _DeviceBase
 from FlashGBX.LK_Device import LK_Device, ANSI, dprint
 from FlashGBX import i18n
@@ -26,14 +31,19 @@ from FlashGBX.RomFileAGB import RomFileAGB
 from FlashGBX.RomFileDMG import RomFileDMG
 
 PLUGIN_NAME = "GBFlash and ChisFlash Carbonate / Beggar"
-PLUGIN_VERSION = "0.3.5"
-PLUGIN_DESCRIPTION = "Adds support for ChisFlash Carbonate and Beggar and a power-on delay for GBFlash."
+PLUGIN_VERSION = "0.3.7"
+PLUGIN_DESCRIPTION = "Supports ChisFlash Carbonate and Beggar, restores GBxCart RW v1.3, and adds a power-on delay for GBFlash."
 IDENTITY_REQUEST = b'\x55\xaa'
 CARBONATE_PRODUCTS = ('ChisFlash Carbonate', 'ChisFlash Carbonate Original')
+BEGGAR_PRODUCT = 'ChisFlash Beggar'
+JR_PRODUCTS = CARBONATE_PRODUCTS + (BEGGAR_PRODUCT,)
+UPDATE_REPOSITORY = 'ChisLightyear/flashgbx-rescue'
+UPDATE_ASSET = 'chisflash_native.py'
 
 
 def _localized_label(english, chinese):
     return chinese if i18n.CONFIGURED_LANGUAGE == 'zh_CN' else english
+
 
 def _usb_products():
     """只读系统中的 USB 产品名称，不打开串口或向设备发送探测命令。"""
@@ -109,7 +119,7 @@ def _prepare_serial(raw):
 
 
 def _identify_chisflash(raw):
-    """仅对产品名称已确认的碳酸钙查询身份，使用以换行结束的短响应。"""
+    """按已确认的 USB 产品名查询 ChisFlash 固件身份。"""
     packet = IDENTITY_REQUEST
     if raw.write(packet) != len(packet):
         raise IOError(_localized_label(
@@ -125,15 +135,15 @@ def _identify_chisflash(raw):
             if part == b'\n':
                 break
     if not reply.endswith(b'\n'):
-        raise IOError(_localized_label('Incomplete Carbonate identification response.', '碳酸钙身份响应不完整'))
+        raise IOError(_localized_label('Incomplete ChisFlash identification response.', 'ChisFlash 身份响应不完整'))
     if not reply.startswith(b'\x01ChisFlash'):
         return None
-    match = re.fullmatch(rb'\x01ChisFlash( Original)? FW C([0-9]+) (RC[^\r\n ]+)\r\n', bytes(reply))
+    match = re.fullmatch(rb'\x01ChisFlash( Original| Beggar)? FW C([0-9]+) (RC[^\r\n ]+)\r\n', bytes(reply))
     if match is None:
         raise IOError(_localized_label(
             'The device identification response is incomplete or unrecognized.',
             '设备身份响应不完整或无法识别'))
-    return {'board': 'original' if match[1] else 'modified',
+    return {'board': {b' Original': 'original', b' Beggar': 'beggar', None: 'modified'}[match[1]],
             'protocol': int(match[2]), 'version': match[3].decode('ascii')}
 
 
@@ -185,6 +195,8 @@ class CarbonateDevice(_PowerOnDelayMixin, _DeviceBase):
     DEVICE_LABEL_SHORT = 'Carbonate'
     USB_IDS = ((0x0483, 0x0721),)
     PCB_VERSIONS = {2: ''}
+    USB_PRODUCTS = CARBONATE_PRODUCTS
+    FIRMWARE_NAMES = {'original': 'ChisFlash Original', 'modified': 'ChisFlash'}
     MAX_BUFFER_READ = 0x2000
     MAX_BUFFER_WRITE = 0x800
     FWUPDATE_ACTION = None
@@ -206,10 +218,10 @@ class CarbonateDevice(_PowerOnDelayMixin, _DeviceBase):
 
     def GetCandidatePorts(self, comports=None):
         products = _usb_products()
-        return [port for port in super().GetCandidatePorts(comports) if products.get(port) in CARBONATE_PRODUCTS]
+        return [port for port in super().GetCandidatePorts(comports) if products.get(port) in self.USB_PRODUCTS]
 
     def TryConnect(self, port, baudrate, keep_open=False):
-        if _usb_products().get(port) not in CARBONATE_PRODUCTS:
+        if _usb_products().get(port) not in self.USB_PRODUCTS:
             return False
         return super().TryConnect(port, baudrate, keep_open=keep_open)
 
@@ -315,7 +327,9 @@ class CarbonateDevice(_PowerOnDelayMixin, _DeviceBase):
         while len(data) < count and time.monotonic() < deadline:
             data.extend(self.DEVICE.read(count - len(data)))
         if len(data) != count:
-            raise IOError(_localized_label('Incomplete Carbonate firmware information response.', '碳酸钙固件信息响应不完整'))
+            raise IOError(_localized_label(
+                'Incomplete ChisFlash firmware information response.',
+                'ChisFlash 固件信息响应不完整'))
         return bytes(data)
 
     def LoadFirmwareVersion(self):
@@ -337,7 +351,7 @@ class CarbonateDevice(_PowerOnDelayMixin, _DeviceBase):
                 return False
             length = self._exact_info(1)[0]
             name = self._exact_info(length).decode('ascii')
-            expected_name = 'ChisFlash Original' if self.IDENTITY['board'] == 'original' else 'ChisFlash'
+            expected_name = self.FIRMWARE_NAMES.get(self.IDENTITY['board'])
             if name != expected_name:
                 return False
             power, boot = self._exact_info(2)
@@ -414,6 +428,25 @@ class CarbonateDevice(_PowerOnDelayMixin, _DeviceBase):
     def GetFirmwareUpdaterClass(self): return None
     def SupportsBootloaderReset(self): return False
     def BootloaderReset(self): return False
+
+
+class BeggarDevice(CarbonateDevice):
+    DEVICE_NAME = BEGGAR_PRODUCT
+    DEVICE_NAME_ZH = 'ChisFlash（盖中盖）'
+    DEVICE_LABEL_LONG = DEVICE_NAME
+    DEVICE_LABEL_SHORT = 'Beggar'
+    @staticmethod
+    def DEVICE_SUPPORT_MESSAGE():
+        return _localized_label(
+            'The Beggar cartridge slot runs at a fixed 3.3 V. Use cartridges that support 3.3 V.',
+            '盖中盖卡槽固定 3.3 V，适用于能在 3.3 V 下工作的卡带。')
+    PCB_VERSIONS = {3: ''}
+    USB_PRODUCTS = (BEGGAR_PRODUCT,)
+    FIRMWARE_NAMES = {'beggar': BEGGAR_PRODUCT}
+
+    def CanSetVoltageByCode(self): return False
+    def IsClkConnected(self): return False
+    def SupportsAudioAsWe(self): return False
 
 
 class NativeProtocolError(IOError):
@@ -541,7 +574,7 @@ class GbxDevice(_DeviceBase):
     def __init__(self):
         self.DEVICE = None
         self.PORT = ''
-        # ???????? FlashGBX ?????????
+        # 首次选择平台时由 FlashGBX 初始化并读取卡头。
         self.MODE = None
         self.FW = {'pcb_ver': 2, 'pcb_name': self.DEVICE_NAME, 'cfw_id': 'N', 'fw_ver': 15,
                    'fw_ts': 0,
@@ -568,11 +601,11 @@ class GbxDevice(_DeviceBase):
     def GetCandidatePorts(self, serial_ports=None):
         ports = serial.tools.list_ports.comports() if serial_ports is None else serial_ports
         products = _usb_products()
-        return [p.device for p in ports if (p.vid, p.pid) in self.USB_IDS and products.get(p.device) not in CARBONATE_PRODUCTS]
+        return [p.device for p in ports if (p.vid, p.pid) in self.USB_IDS and products.get(p.device) not in JR_PRODUCTS]
 
     def Initialize(self, flashcarts, port=None, max_baud=2000000):
         for candidate in ([port] if port else self.GetCandidatePorts()):
-            if _usb_products().get(candidate) in CARBONATE_PRODUCTS:
+            if _usb_products().get(candidate) in JR_PRODUCTS:
                 continue
             raw = None
             try:
@@ -859,11 +892,157 @@ class GbxDevice(_DeviceBase):
             '盖中盖基础协议不支持逐次 CLK 脉冲'))
 
 
+class GBxCartRWDevice(OfficialGBxCartRW):
+    def GetFullNameLabel(self):
+        if self.FW["pcb_ver"] == 4 and i18n.CONFIGURED_LANGUAGE == "zh_CN":
+            return f"{self.GetFullName()} – 固件 {self.GetFirmwareVersion()}"
+        return super().GetFullNameLabel()
+
+    def FirmwareUpdateAvailable(self):
+        pcb = self.FW["pcb_ver"]
+        if pcb != 4:
+            return super().FirmwareUpdateAvailable()
+
+        # 恢复 5.1 对 v1.3 的固件要求，继续使用宿主的固件更新入口。
+        self.FW_UPDATE_REQ = (
+            self.FW["fw_ver"] == 0 or self.FW["fw_ts"] != self.DEVICE_LATEST_FW_TS[pcb]
+        )
+        return self.FW_UPDATE_REQ
+
+
+
+def _plugin_source_version(source):
+    from FlashGBX.PluginLoader import _GetPluginMetadata
+
+    metadata = _GetPluginMetadata(source, UPDATE_ASSET)
+    version = metadata.get('version', '')
+    if metadata['name'] != PLUGIN_NAME or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version):
+        raise ValueError(_localized_label('The file is not a ChisFlash plugin release.', '这个文件不是有效的 ChisFlash 插件发布版。'))
+    return version
+
+
+def _version_parts(version):
+    return tuple(int(part) for part in version.split('.'))
+
+
+def _find_plugin_update(path):
+    current = _plugin_source_version(path.read_bytes())
+    headers = {'User-Agent': 'ChisFlash-FlashGBX-Plugin',
+               'Accept': 'application/vnd.github+json'}
+    api = f'https://api.github.com/repos/{UPDATE_REPOSITORY}/releases/latest'
+    with urlopen(Request(api, headers=headers), timeout=8) as response:
+        release = json.load(response)
+
+    if not any(asset['name'] == UPDATE_ASSET for asset in release['assets']):
+        raise ValueError(_localized_label('The latest release has no ChisFlash plugin attachment.',
+                                          '最新发布缺少 ChisFlash 插件附件。'))
+    tag = quote(release['tag_name'], safe='')
+    asset_url = f'https://github.com/{UPDATE_REPOSITORY}/releases/download/{tag}/{UPDATE_ASSET}'
+    with urlopen(Request(asset_url, headers={'User-Agent': headers['User-Agent']}), timeout=8) as response:
+        source = response.read()
+
+    available = _plugin_source_version(source)
+    return current, available, source if _version_parts(available) > _version_parts(current) else None
+
+
+def _replace_plugin_file(path, source):
+    # 临时文件和插件位于同一目录，写完后一次替换。
+    handle = NamedTemporaryFile(dir=path.parent, prefix='.chisflash-update-', suffix='.tmp', delete=False)
+    temporary = Path(handle.name)
+    try:
+        with handle:
+            handle.write(source)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _add_plugin_update_action():
+    # FlashGBX 先载入插件，再创建 GUI。CLI 无须载入 Qt。
+    gui = sys.modules.get('FlashGBX.FlashGBX_GUI')
+    if gui is None:
+        return
+    from FlashGBX.pyside import QApplication, QtCore, QtWidgets
+
+    def attach():
+        window = next((widget for widget in QApplication.topLevelWidgets()
+                       if isinstance(widget, gui.FlashGBX_GUI)), None)
+        if window is None:
+            return
+        label = _localized_label('Check for ChisFlash plugin updates…', '检查 ChisFlash 插件更新…')
+        action = window.mnuTools.addAction(label)
+        path = Path(__file__)
+        title = _localized_label('ChisFlash Plugin Update', 'ChisFlash 插件更新')
+
+        def check():
+            action.setEnabled(False)
+            action.setText(_localized_label('Checking ChisFlash plugin updates…', '正在检查 ChisFlash 插件更新…'))
+            results = SimpleQueue()
+            timer = QtCore.QTimer(action)
+
+            def fetch():
+                try:
+                    results.put((_find_plugin_update(path), None))
+                except (OSError, ValueError, KeyError, TypeError) as error:
+                    results.put((None, str(error)))
+
+            def finish():
+                try:
+                    result, error = results.get_nowait()
+                except Empty:
+                    return
+                timer.stop()
+                timer.deleteLater()
+                action.setText(label)
+                action.setEnabled(True)
+                if error is not None:
+                    QtWidgets.QMessageBox.warning(window, title, _localized_label(
+                        'Could not check GitHub for a plugin update.\n', '无法从 GitHub 检查插件更新。\n') + error)
+                    return
+
+                current, available, source = result
+                if source is None:
+                    QtWidgets.QMessageBox.information(window, title, _localized_label(
+                        f'No newer version on GitHub. Installed: {current}. GitHub: {available}.',
+                        f'GitHub 上没有更新版本。已安装 {current}，线上版本 {available}。'))
+                    return
+
+                answer = QtWidgets.QMessageBox.question(window, title, _localized_label(
+                    f'Install ChisFlash plugin {available} over {current}? Restart FlashGBX to load it.',
+                    f'将 ChisFlash 插件从 {current} 更新到 {available}？更新后重启 FlashGBX 生效。'),
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No)
+                if answer != QtWidgets.QMessageBox.Yes:
+                    return
+                try:
+                    on_disk = _plugin_source_version(path.read_bytes())
+                    if _version_parts(available) <= _version_parts(on_disk):
+                        return
+                    _replace_plugin_file(path, source)
+                except (OSError, ValueError) as error:
+                    QtWidgets.QMessageBox.warning(window, title, _localized_label(
+                        'Could not install the plugin update.\n', '无法安装插件更新。\n') + str(error))
+                else:
+                    QtWidgets.QMessageBox.information(window, title, _localized_label(
+                        f'ChisFlash plugin {available} installed. Restart FlashGBX to use it.',
+                        f'ChisFlash 插件已更新到 {available}。请重启 FlashGBX。'))
+
+            timer.timeout.connect(finish)
+            timer.start(100)
+            threading.Thread(target=fetch, name='ChisFlashUpdate', daemon=True).start()
+
+        action.triggered.connect(check)
+
+    QtCore.QTimer.singleShot(0, attach)
+
+
 def plugin_entry():
     # 替换注册表中的官方后端，不增加第二个候选，也不修改官方模块。
     for index, module in enumerate(HW_DEVICES):
         if module.GbxDevice is _GBFlashBase:
             HW_DEVICES[index] = SimpleNamespace(GbxDevice=GBFlashDevice)
-    for backend in (GbxDevice, CarbonateDevice):
+        elif module.GbxDevice is OfficialGBxCartRW:
+            HW_DEVICES[index] = SimpleNamespace(GbxDevice=GBxCartRWDevice)
+    for backend in (GbxDevice, CarbonateDevice, BeggarDevice):
         if not any(getattr(module.GbxDevice, 'DEVICE_NAME', None) == backend.DEVICE_NAME for module in HW_DEVICES):
             HW_DEVICES.insert(0, SimpleNamespace(GbxDevice=backend))
+    _add_plugin_update_action()
